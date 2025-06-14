@@ -1,4 +1,3 @@
-# HuberEtAl2025_1_RapidFFR
 # EEG Analysis Pipeline
 
 A comprehensive multi-language pipeline for processing and analysing EEG data, implementing preprocessing, spectral analysis, and statistical visualisation across MATLAB, Python, and R.
