@@ -67,7 +67,7 @@ For bootstrap computations in the Python scripts, parallel processing is recomme
 
 1. **Clone the repository**
    ```bash
-   git clone [repository-url]
+   git clone https://github.com/jonas0huber/HuberEtAl2025_1_RapidFFR.git
    cd ffr_analysis_pipeline
    ```
 
