@@ -1,0 +1,463 @@
+---
+title: "FFR Experiment 1 Plots"
+author: "Jonas"
+date: "2025-03-25"
+output: html_document
+---
+
+Generates all visualisations for Experiment 1, comparing FFR data obtained via Rapid and Conventional recording methods across multiple harmonics.
+
+============================================================================
+SETUP AND DEPENDENCIES
+============================================================================
+
+```{r setup, include=FALSE}
+# Clear workspace for clean start
+rm(list = ls())
+
+# Load required libraries with error handling
+required_packages <- c("tidyverse", "ggpubr")
+
+lapply(required_packages, function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+})
+
+# Set global constants
+NUM_PARTICIPANTS      <- 16
+ALPHA_LEVEL           <- 0.05
+HARMONICS_OF_INTEREST <- c("F0", "H2", "H3", "H4", "H5", "H6", "H7")
+```
+
+============================================================================
+DATA LOADING & PROCESSING
+============================================================================
+
+```{r data_loading}
+# Define file paths (consider moving to config file)
+data_path   <- "./input/"
+output_path <- "./output/"
+
+# Function to load and preprocess data
+load_and_preprocess_data <- function(filename) {
+  file_path <- file.path(data_path, filename)
+  
+  read_csv(file_path, show_col_types = FALSE) 
+}
+
+# Load both datasets
+snr_data    <- load_and_preprocess_data("SNRIterationsMatrixClean.csv")
+signal_data <- load_and_preprocess_data("SignalIterationsMatrixClean.csv")
+
+# Calculate time matching parameters for Rapid vs Conventional comparison
+rapid_max_time <- snr_data %>%
+  filter(listener == 1, condition == "Rapid", run == "Run1", harmonic == "F0") %>%
+  pull(recording_time) %>%
+  max()
+
+# Find matching recording time in Conventional condition
+matched_recording_time <- snr_data %>%
+  filter(listener == 1, condition == "Conv", run == "Run1", harmonic == "F0") %>%
+  mutate(time_diff = abs(recording_time - rapid_max_time)) %>%
+  filter(time_diff == min(time_diff)) %>%
+  pull(recording_time) %>%
+  first()
+
+# Find matching stimulation time
+matched_stimulation_time <- snr_data %>%
+  filter(listener == 1, condition == "Conv", run == "Run1", harmonic == "F0") %>%
+  mutate(time_diff = abs(stimulation_time - rapid_max_time)) %>%
+  filter(time_diff == min(time_diff)) %>%
+  pull(stimulation_time) %>%
+  first()
+
+cat("Rapid max time:", rapid_max_time, "\n")
+cat("Matched recording time:", matched_recording_time, "\n")
+cat("Matched stimulation time:", matched_stimulation_time, "\n")
+```
+
+============================================================================
+UTILITY FUNCTION
+============================================================================
+
+```{r utility_functions}
+# Function to calculate confidence intervals
+calculate_confidence_intervals <- function(data, value_col, n = NUM_PARTICIPANTS) {
+  data %>%
+    summarise(
+      mean_value = mean({{value_col}}, na.rm = TRUE),
+      sd_value   = sd({{value_col}}, na.rm = TRUE),
+      ci_lower   = mean_value - qt(0.975, df = n - 1) * sd_value / sqrt(n),
+      ci_upper   = mean_value + qt(0.975, df = n - 1) * sd_value / sqrt(n),
+      .groups    = "keep"
+    )
+}
+
+# Function to add time columns based on condition
+add_time_columns <- function(data) {
+  data %>%
+    mutate(
+      recording_time_mins = case_when(
+        str_starts(condition, "C") ~ iteration * (5/100),
+        str_starts(condition, "R") ~ iteration * (1.933333/100),
+        TRUE ~ NA_real_
+      ),
+      stimulation_time_mins = case_when(
+        str_starts(condition, "C") ~ iteration * (2.734375/100),
+        str_starts(condition, "R") ~ iteration * (1.933333/100),
+        TRUE ~ NA_real_
+      )
+    )
+}
+
+# Function to create growth plots
+create_growth_plot <- function(data, x_var, x_label, title_suffix = "") {
+  ggplot(data, aes(x = {{x_var}}, y = mean_value, 
+                   group = condition, color = condition)) +
+    geom_smooth(aes(ymin = ci_lower, ymax = ci_upper, fill = condition), 
+                stat = "identity") +
+    scale_x_continuous(name = x_label) +
+    scale_y_continuous(name = "SNR (dB)") +
+    theme_bw() +
+    theme(legend.position = "bottom")
+}
+
+# Function to save plots with consistent parameters
+save_plot_both_formats <- function(plot_obj, filename, width = 20, height = 10) {
+  # Save as PNG
+  ggsave(
+    plot = plot_obj,
+    filename = file.path(output_path, paste0(filename, ".png")),
+    device = "png", dpi = 300, width = width, height = height, units = "cm"
+  )
+  
+  # Save as TIFF
+  ggsave(
+    plot = plot_obj,
+    filename = file.path(output_path, paste0(filename, ".tiff")),
+    device = "tiff", dpi = 1200, width = width, height = height, units = "cm"
+  )
+}
+```
+
+============================================================================
+F0 ANALYSIS: RECORDING/STIMULATIOIN TIME GROWTH
+============================================================================
+
+```{r f0_analysis}
+# Prepare F0 growth data
+f0_growth_data <- snr_data %>%
+  filter(harmonic == "F0", run == "Run1") %>%
+  group_by(condition, iteration) %>%
+  calculate_confidence_intervals(data_value) %>%
+  add_time_columns()
+
+# Create F0 recording time growth plot
+f0_recording_plot <- create_growth_plot(
+  f0_growth_data, 
+  recording_time_mins, 
+  "Elapsed Time (mins)"
+)
+
+# Create F0 stimulation time growth plot  
+f0_stimulation_plot <- create_growth_plot(
+  f0_growth_data, 
+  stimulation_time_mins, 
+  "Stimulation Time (mins)"
+)
+
+# Combine plots
+f0_combined_plot <- ggarrange(
+  f0_recording_plot, f0_stimulation_plot,
+  labels = c("A", "B"),
+  common.legend = TRUE,
+  legend = "bottom",
+  ncol = 2
+)
+
+# Display plots
+f0_recording_plot
+f0_stimulation_plot
+f0_combined_plot
+```
+
+============================================================================
+ALL HARMONICS ANALYSIS: RECORDING/STIMULATIOIN TIME GROWTH
+============================================================================
+
+```{r harmonics_analysis}
+# Prepare harmonics growth data
+harmonics_growth_data <- snr_data %>%
+  filter(harmonic %in% HARMONICS_OF_INTEREST, run == "Run1") %>%
+  group_by(condition, iteration, harmonic) %>%
+  calculate_confidence_intervals(data_value) %>%
+  add_time_columns()
+
+# Create harmonics recording time plot
+harmonics_recording_plot <- harmonics_growth_data %>%
+  ggplot(aes(x = recording_time_mins, y = mean_value, 
+             group = condition, color = condition)) +
+  geom_smooth(aes(ymin = ci_lower, ymax = ci_upper, fill = condition), 
+              stat = "identity") +
+  scale_x_continuous(name = "Elapsed Time (mins)") +
+  scale_y_continuous(name = "SNR (dB)") +
+  facet_wrap(~harmonic) +
+  theme_bw()
+
+# Create harmonics stimulation time plot
+harmonics_stimulation_plot <- harmonics_growth_data %>%
+  ggplot(aes(x = stimulation_time_mins, y = mean_value, 
+             group = condition, color = condition)) +
+  geom_smooth(aes(ymin = ci_lower, ymax = ci_upper, fill = condition), 
+              stat = "identity") +
+  scale_x_continuous(name = "Stimulation Time (mins)") +
+  scale_y_continuous(name = "SNR (dB)") +
+  facet_wrap(~harmonic) +
+  theme_bw()
+
+harmonics_recording_plot
+harmonics_stimulation_plot
+```
+
+============================================================================
+BOXPLOT ANALYSIS: MATCHED RECORDING TIME
+============================================================================
+
+```{r boxplot_analysis}
+# Prepare matched data for boxplot
+matched_data <- snr_data %>%
+  filter(
+    harmonic %in% HARMONICS_OF_INTEREST,
+    run == "Run1",
+    (condition == "Rapid" & iteration == 100) |
+    (condition == "Conv" & recording_time == matched_recording_time)
+  )
+
+# Create boxplot
+boxplot_matched <- ggplot(matched_data, 
+                         aes(x = harmonic, y = data_value, fill = condition)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  geom_jitter(color = "black", size = 0.7, alpha = 0.3, 
+              position = position_jitterdodge(jitter.width = 0.01)) +
+  scale_x_discrete(name = "Harmonic") +
+  scale_y_continuous(name = "SNR (dB)") +
+  theme_bw()
+
+# Generate summary statistics
+summary_stats <- matched_data %>%
+  group_by(harmonic, condition) %>%
+  summarise(
+    mean_snr = mean(data_value, na.rm = TRUE),
+    sd_snr = sd(data_value, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+boxplot_matched
+summary_stats
+```
+
+============================================================================
+CORRELATION ANALYSIS: SIGNAL RAPID VS CONVENTIONAL
+============================================================================
+
+```{r correlation_analysis}
+# Prepare correlation data
+correlation_data <- signal_data %>%
+  filter(
+    run          == "Run1",
+    iteration    == 100,
+    signal_noise == "Signal",
+    harmonic %in% HARMONICS_OF_INTEREST
+  ) %>%
+  select(listener, condition, harmonic, data_value) %>%
+  pivot_wider(names_from = condition, values_from = data_value)
+
+# Calculate summary statistics for plot
+signal_summary_stats <- correlation_data %>%
+  group_by(harmonic) %>%
+  summarise(
+    sd_conv = sd(Conv, na.rm = TRUE),
+    sd_rapid = sd(Rapid, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(label = paste0(round(sd_conv, 3), "/", round(sd_rapid, 3)))
+
+# Create basic correlation plot
+correlation_plot_basic <- correlation_data %>%
+  ggplot(aes(x = Rapid, y = Conv)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  geom_abline(intercept = 0, slope = 1, color = "grey", 
+              linetype = "dashed", size = 0.5) +
+  scale_x_continuous(name = "Rapid FFR Signal Amplitude (μV RMS)") +
+  scale_y_continuous(name = "Conventional FFR Signal Amplitude (μV RMS)") +
+  facet_wrap(~harmonic) +
+  theme_bw()
+
+# Create enhanced quadratic correlation plot
+correlation_plot_enhanced <- correlation_data %>%
+  ggplot(aes(x = Rapid, y = Conv)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  geom_abline(intercept = 0, slope = 1, color = "grey", 
+              linetype = "dashed", size = 0.5) +
+  scale_x_continuous(name = "Rapid FFR Signal Amplitude (μV RMS)", 
+                     limits = c(0, 0.22)) +
+  scale_y_continuous(name = "Conventional FFR Signal Amplitude (μV RMS)", 
+                     limits = c(0, 0.22)) +
+  geom_text(data = tibble(harmonic = HARMONICS_OF_INTEREST),
+            aes(x = 0.01, y = 0.2, label = harmonic),
+            hjust = 0, vjust = 0, inherit.aes = FALSE, size = 3) +
+  geom_text(data = signal_summary_stats,
+            aes(x = 0.135, y = 0.01, label = label),
+            hjust = 0, vjust = 0, inherit.aes = FALSE, size = 2) +
+  facet_wrap(~harmonic) +
+  theme_bw() +
+  theme(
+    aspect.ratio = 1,
+    axis.text.x = element_text(size = 7),
+    strip.text.x = element_blank()
+  )
+
+correlation_plot_basic
+correlation_plot_enhanced
+```
+
+============================================================================
+TEST-RETEST RELIABILITY ANALYSIS
+============================================================================
+
+```{r test_retest_analysis}
+# Function to create test-retest data
+create_test_retest_data <- function(data, condition_filter, time_filter = NULL) {
+  filtered_data <- data %>%
+    filter(
+      harmonic %in% HARMONICS_OF_INTEREST,
+      condition == condition_filter,
+      signal_noise == "Signal"
+    )
+  
+  if (!is.null(time_filter)) {
+    filtered_data <- filtered_data %>%
+      filter(recording_time == time_filter)
+  }else{
+    filtered_data <- filtered_data %>%
+      filter(iteration == 100)
+  }
+  
+  filtered_data %>%
+    select(listener, run, harmonic, data_value) %>%
+    pivot_wider(names_from = run, values_from = data_value)
+}
+
+# Function to create test-retest plot
+create_test_retest_plot <- function(data, x_label, y_label) {
+  data %>%
+    ggplot(aes(x = Run1, y = Run2)) +
+    geom_point() +
+    geom_smooth(method = "lm") +
+    geom_abline(intercept = 0, slope = 1, color = "grey", 
+                linetype = "dashed", size = 0.5) +
+    scale_x_continuous(name = x_label) +
+    scale_y_continuous(name = y_label) +
+    geom_text(data = tibble(harmonic = HARMONICS_OF_INTEREST),
+              aes(x = 0.01, y = 0.2, label = harmonic),
+              hjust = 0, vjust = 0, inherit.aes = FALSE, size = 3) +
+    facet_wrap(~harmonic) +
+    theme_bw() +
+    theme(
+      aspect.ratio = 1,
+      axis.text.x = element_text(size = 7),
+      strip.text.x = element_blank()
+    )
+}
+
+# Create Rapid test-retest data and plot
+rapid_test_retest_data <- create_test_retest_data(signal_data, "Rapid")
+rapid_test_retest_plot <- create_test_retest_plot(
+  rapid_test_retest_data,
+  "Run 1 Rapid FFR Signal Amplitude (μV RMS)",
+  "Run 2 Rapid FFR Signal Amplitude (μV RMS)"
+)
+
+# Create Conventional test-retest data and plot (time-matched)
+conv_test_retest_data <- create_test_retest_data(
+  signal_data, "Conv", matched_recording_time
+)
+conv_test_retest_plot <- create_test_retest_plot(
+  conv_test_retest_data,
+  "Run 1 Conv FFR Signal Amplitude (μV RMS)",
+  "Run 2 Conv FFR Signal Amplitude (μV RMS)"
+)
+
+# Create combined test-retest plot
+x_axis_ticks <- c(0.0, 0.05, 0.1, 0.15, 0.2)
+combined_test_retest_plot <- ggarrange(
+  rapid_test_retest_plot + 
+    scale_x_continuous(labels = x_axis_ticks,
+                       name = "Run 1 Rapid FFR Signal Amplitude (μV RMS)"),
+  conv_test_retest_plot + 
+    scale_x_continuous(labels = x_axis_ticks,
+                       name = "Run 1 Conv FFR Signal Amplitude (μV RMS)"),
+  labels = c("A", "B"),
+  common.legend = TRUE,
+  legend = "bottom",
+  ncol = 2
+)
+
+rapid_test_retest_plot
+conv_test_retest_plot
+combined_test_retest_plot
+```
+
+============================================================================
+SAVE ALL PLOTS
+============================================================================
+```{r save_plots}
+# List of plots to save with their corresponding names and dimensions
+plots_to_save <- list(
+  list(plot = f0_recording_plot, name = "F0RecordingTimeGrowthPlot", 
+       width = 20, height = 10),
+  list(plot = f0_stimulation_plot, name = "F0StimulationTimeGrowthPlot", 
+       width = 20, height = 10),
+  list(plot = f0_combined_plot, name = "F0GrowthPlot", 
+       width = 20, height = 10),
+  list(plot = harmonics_recording_plot, name = "HarmonicsSNRRecordingTimeGrowthPlotMean", 
+       width = 20, height = 10),
+  list(plot = harmonics_stimulation_plot, name = "HarmonicsSNRStimulationTimeGrowthPlotMean", 
+       width = 20, height = 10),
+  list(plot = boxplot_matched, name = "BoxplotMatchedRecordingTime", 
+       width = 20, height = 10),
+  list(plot = correlation_plot_enhanced, name = "CorrSignalRapidConvQuadratic", 
+       width = 12, height = 12),
+  list(plot = rapid_test_retest_plot, name = "RapidSignalRun1Run2", 
+       width = 12, height = 12),
+  list(plot = conv_test_retest_plot, name = "ConvSignalRun1Run2Matched", 
+       width = 12, height = 12),
+  list(plot = combined_test_retest_plot, name = "TestRetestPlot", 
+       width = 24, height = 12)
+)
+
+# Save all plots using lapply instead of manual repetition
+lapply(plots_to_save, function(plot_info) {
+  save_plot_both_formats(
+    plot_info$plot, 
+    plot_info$name, 
+    plot_info$width, 
+    plot_info$height
+  )
+})
+
+cat("All plots saved successfully to:", output_path, "\n")
+```
+
+============================================================================
+SESSION INFORMATION
+============================================================================
+```{r session_info}
+# Print session information for reproducibility
+sessionInfo()
+```

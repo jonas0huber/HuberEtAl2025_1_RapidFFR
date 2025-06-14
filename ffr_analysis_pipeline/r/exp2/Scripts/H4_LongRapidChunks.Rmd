@@ -1,0 +1,314 @@
+---
+title: "Long Rapid FFR Analysis"
+author: "Jonas"
+date: "2024-09-10"
+output: html_document
+---
+
+Analyses the behaviour of the Rapid FFR recording method under continuous stimulation over a 9-minute period, assessing potential response saturation.
+Research Question 4: Does prolonged stimulation cause saturation in the Rapid FFR response?
+
+=============================================================================
+SETUP AND CONFIGURATION
+=============================================================================
+
+```{r setup, include=FALSE}
+# Clear environment for reproducible analysis
+rm(list = ls())
+
+# Load required packages with error handling
+required_packages <- c("tidyverse", "lme4")
+
+lapply(required_packages, function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+})
+```
+
+```{r constants}
+# Define analysis parameters
+HARMONICS_OF_INTEREST <- c('F0', 'H2', 'H3', 'H4', 'H5', 'H6', 'H7')
+HARMONIC_MAPPING      <- c("F0" = 1, "H2" = 2, "H3" = 3, "H4" = 4, "H5" = 5, "H6" = 6, "H7" = 7)
+PARTICION_LEVELS      <- c('1', '2', '3', '4', '5', '6')
+EFR_THRESHOLD         <- 4  # Harmonics below this are EFR, above are TFS
+MAX_ITERATIONS        <- 1e6
+
+# File paths (consider moving to config file)
+DATA_PATH            <- "./input/"
+SNR_INPUT_FILE       <- paste0(DATA_PATH, "SNRChunksMatrixClean.csv")
+SIGNAL_INPUT_FILE    <- paste0(DATA_PATH, "SignalChunksMatrixClean.csv")
+```
+
+=============================================================================
+DATA LOADING AND PREPROCESSING FUNCTIONS
+=============================================================================
+
+```{r data_functions}
+#' Load and preprocess harmonic data
+#' @param file_path Path to the CSV file
+#' @return Cleaned and formatted dataframe
+load_harmonic_data <- function(file_path) {
+  tryCatch({
+    data <- read_csv(file_path, show_col_types = FALSE) %>%
+      mutate(
+        data_value = as.numeric(data_value),
+        listener = as.factor(listener)
+      )
+    
+    return(data)
+  }, error = function(e) {
+    stop(paste("Error loading data from", file_path, ":", e$message))
+  })
+}
+
+#' Convert harmonic labels to numeric values for analysis
+#' @param data Dataframe containing harmonic data
+#' @return Dataframe with numeric harmonic values
+convert_harmonics_to_numeric <- function(data) {
+  data %>%
+    filter(harmonic %in% HARMONICS_OF_INTEREST) %>%
+    mutate(
+      harmonic_numeric = recode(harmonic, !!!HARMONIC_MAPPING),
+      chunk_numeric = as.numeric(chunk)
+    ) %>%
+    group_by(chunk_numeric, harmonic_numeric) %>%
+    mutate(
+      mean_snr = mean(data_value, na.rm = TRUE),
+      median_snr = median(data_value, na.rm = TRUE)
+    ) %>%
+    ungroup() %>%
+    select(listener, harmonic_numeric, chunk_numeric, data_value, mean_snr, median_snr)
+}
+
+#' Separate data into EFR and TFS components
+#' @param data Processed harmonic data
+#' @return List containing EFR and TFS datasets
+separate_efr_tfs <- function(data) {
+  list(
+    efr = filter(data, harmonic_numeric < EFR_THRESHOLD),
+    tfs = filter(data, harmonic_numeric >= EFR_THRESHOLD)
+  )
+}
+```
+
+=============================================================================
+STATISTICAL MODELLING FUNCTIONS
+=============================================================================
+
+```{r modeling_functions}
+#' Create optimal mixed-effects model using backward selection
+#' @param data Dataset for modeling
+#' @param response_var Response variable name
+#' @return Optimal lmer model
+create_optimal_model <- function(data, response_var = "data_value") {
+  # Full model with quadratic terms and interactions
+  full_formula <- as.formula(paste(
+    response_var, 
+    "~ (harmonic_numeric + I(harmonic_numeric^2)) * (chunk_numeric + I(chunk_numeric^2)) + (1|listener)"
+  ))
+  
+  # Fit full model
+  full_model <- lmer(
+    full_formula,
+    data       = data,
+    REML       = FALSE,
+    na.action  = na.fail,
+    control    = lmerControl(optCtrl = list(maxfun = MAX_ITERATIONS))
+  )
+  
+  # Backward selection to find optimal model
+  optimal_model <- optimize_model_backward(full_model, data, response_var)
+  
+  return(optimal_model)
+}
+
+#' Perform backward model selection
+#' @param full_model Starting full model
+#' @param data Dataset
+#' @param response_var Response variable name
+#' @return Optimized model
+optimize_model_backward <- function(full_model, data, response_var) {
+  current_model <- full_model
+  
+  # Remove interaction terms if not significant
+  reduced_model <- update(current_model, . ~ . - (chunk_numeric + I(chunk_numeric^2)):(harmonic_numeric + I(harmonic_numeric^2)))
+  
+  if (anova(current_model, reduced_model)$`Pr(>Chisq)`[2] > 0.05) {
+    current_model <- reduced_model
+  }
+  
+  # Test quadratic particion term
+  test_model <- update(current_model, . ~ . - I(chunk_numeric^2))
+  if (anova(current_model, test_model)$`Pr(>Chisq)`[2] > 0.05) {
+    current_model <- test_model
+  }
+  
+  # Test linear particion term
+  test_model <- update(current_model, . ~ . - chunk_numeric)
+  if (anova(current_model, test_model)$`Pr(>Chisq)`[2] > 0.05) {
+    current_model <- test_model
+  }
+  
+  return(current_model)
+}
+
+#' Generate model predictions and create visualization
+#' @param model Fitted lmer model
+#' @param data Original dataset
+#' @param y_label Y-axis label for plot
+#' @return List containing predictions and plot
+create_model_predictions <- function(model, data, y_label) {
+  # Generate predictions
+  predictions_data <- data %>%
+    mutate(predicted_values = predict(model, newdata = ., re.form = NA))
+  
+  # Create visualization
+  prediction_plot <- ggplot(predictions_data, aes(x = chunk_numeric)) +
+    geom_line(aes(y = predicted_values), color = "blue", size = 1) +
+    geom_point(aes(y = data_value), alpha = 0.3) +
+    geom_point(aes(y = mean_snr), shape = 21, size = 4, fill = "white") +
+    geom_point(aes(y = median_snr), shape = 4, size = 4) +
+    scale_x_continuous(name = "Partition") +
+    scale_y_continuous(name = y_label) +
+    facet_wrap(~harmonic_numeric, labeller = labeller(harmonic_numeric = function(x) paste("Harmonic", x))) +
+    theme_bw() +
+    theme(
+      panel.grid.minor = element_blank(),
+      strip.background = element_rect(fill = "lightgray")
+    )
+  
+  return(list(
+    data = predictions_data,
+    plot = prediction_plot
+  ))
+}
+```
+
+=============================================================================
+MAIN ANALYSIS PIPELINE
+=============================================================================
+
+```{r main_analysis}
+# Load and preprocess data
+cat("Loading SNR data...\n")
+snr_raw_data <- load_harmonic_data(SNR_INPUT_FILE)
+
+cat("Loading Signal data...\n") 
+signal_raw_data <- load_harmonic_data(SIGNAL_INPUT_FILE)
+
+# Prepare datasets for analysis
+snr_analysis_data    <- convert_harmonics_to_numeric(snr_raw_data)
+signal_analysis_data <- signal_raw_data %>%
+  filter(signal_noise == "Signal") %>%
+  convert_harmonics_to_numeric()
+
+# Separate into EFR and TFS components
+snr_components    <- separate_efr_tfs(snr_analysis_data)
+signal_components <- separate_efr_tfs(signal_analysis_data)
+
+cat("Data preprocessing complete.\n")
+```
+
+=============================================================================
+SNR ANALYSIS
+=============================================================================
+
+```{r snr_analysis}
+cat("Analyzing SNR data...\n")
+
+# EFR SNR Analysis
+cat("  - Fitting EFR SNR model...\n")
+efr_snr_model   <- create_optimal_model(snr_components$efr, "data_value")
+efr_snr_results <- create_model_predictions(efr_snr_model, snr_components$efr, "SNR (dB)")
+
+cat("EFR SNR Model Summary:n")
+summary(efr_snr_model)
+
+# TFS SNR Analysis  
+cat("  - Fitting TFS SNR model...\n")
+tfs_snr_model   <- create_optimal_model(snr_components$tfs, "data_value")
+tfs_snr_results <- create_model_predictions(tfs_snr_model, snr_components$tfs, "SNR (dB)")
+
+cat("TFS SNR Model Summary:\n")
+summary(tfs_snr_model)
+
+# Display plots
+efr_snr_results$plot + ggtitle("EFR SNR Analysis")
+tfs_snr_results$plot + ggtitle("TFS SNR Analysis")
+```
+
+=============================================================================
+SIGNAL ANALYSIS
+=============================================================================
+
+```{r signal_analysis}
+cat("Analyzing Signal data...\n")
+
+# EFR Signal Analysis
+cat("  - Fitting EFR Signal model...\n")
+efr_signal_model   <- create_optimal_model(signal_components$efr, "data_value")
+efr_signal_results <- create_model_predictions(efr_signal_model, signal_components$efr, "Signal level (μV)")
+
+cat("EFR Signal Model Summary:\n")
+summary(efr_signal_model)
+
+# TFS Signal Analysis
+cat("  - Fitting TFS Signal model...\n")
+tfs_signal_model   <- create_optimal_model(signal_components$tfs, "data_value")
+tfs_signal_results <- create_model_predictions(tfs_signal_model, signal_components$tfs, "Signal level (μV)")
+
+cat("TFS Signal Model Summary:\n")
+summary(tfs_signal_model)
+
+# Display plots
+efr_signal_results$plot + ggtitle("EFR Signal Analysis")
+tfs_signal_results$plot + ggtitle("TFS Signal Analysis")
+```
+
+=============================================================================
+RESULTS EXPORT
+=============================================================================
+
+```{r export_results}
+#' Prepare final results for export
+#' @param efr_results EFR analysis results
+#' @param tfs_results TFS analysis results
+#' @return Combined dataframe with proper factor labels
+prepare_export_data <- function(efr_results, tfs_results) {
+  # Reverse mapping for harmonic labels
+  harmonic_labels        <- names(HARMONIC_MAPPING)
+  names(harmonic_labels) <- HARMONIC_MAPPING
+  
+  combined_data <- bind_rows(efr_results$data, tfs_results$data) %>%
+    mutate(
+      harmonic = recode_factor(harmonic_numeric, !!!harmonic_labels),
+      chunk    = chunk_numeric
+    ) %>%
+    select(-c(harmonic_numeric, chunk_numeric) ) # Remove numeric version
+  
+  return(combined_data)
+}
+
+# Prepare and export results
+cat("Preparing results for export...\n")
+
+snr_final_results    <- prepare_export_data(efr_snr_results, tfs_snr_results)
+signal_final_results <- prepare_export_data(efr_signal_results, tfs_signal_results)
+
+# Export results
+write_csv(snr_final_results, paste0(DATA_PATH, "SNRChunksMatrixPred.csv"))
+write_csv(signal_final_results, paste0(DATA_PATH, "SignalChunksMatrixPred.csv"))
+
+cat("Analysis complete! Results exported to:", DATA_PATH, "\n")
+```
+
+=============================================================================
+SESSION INFORMATION
+=============================================================================
+
+```{r session_info}
+# Document the R session for reproducibility
+sessionInfo()
+```

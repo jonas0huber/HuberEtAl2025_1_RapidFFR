@@ -1,0 +1,476 @@
+---
+title: "Test-Retest Reliability Analysis: Conventional vs Rapid FFR"
+author: "Jonas"
+date: "2025-03-22"
+output: html_document
+---
+
+Evaluates test-retest reliability of FFR measurements across Rapid and Conventional methods using ICC and correlation metrics.
+Research Question 3: Are there differences in test-retest reliability (ICC) between the Rapid and Conventional FFR approaches?
+
+=============================================================================
+SETUP AND CONFIGURATION
+=============================================================================
+
+```{r setup, include=FALSE}
+# Clear workspace for clean start
+rm(list = ls())
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r load_packages, include=FALSE}
+# Load required libraries with error handling
+required_packages <- c("tidyverse", "irr")
+
+lapply(required_packages, function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+})
+```
+
+```{r load_data, include=FALSE}
+# File paths - consider using here::here() for better path management
+data_path <-  "./input/"
+
+# Load SNR data
+snr_data <- read_csv(file.path(data_path, "SNRIterationsMatrixClean.csv"))
+
+# Load Signal data  
+signal_data <- read_csv(file.path(data_path, "SignalIterationsMatrixClean.csv"))
+
+```
+
+=============================================================================
+DATA PREPROCESSING
+=============================================================================
+
+```{r data_preprocessing}
+# Constants for harmonics of interest
+HARMONICS_OF_INTEREST   <- c('F0', 'H2', 'H3', 'H4', 'H5', 'H6', 'H7')
+TARGET_ITERATION_RAPID  <- 100
+
+# Find matching recording time between Rapid and Conventional conditions
+find_matching_recording_time <- function(snr_data) {
+  # Get maximum recording time for Rapid condition
+  rapid_max_time <- snr_data %>%
+    filter(
+      listener == 1,
+      condition == "Rapid",
+      run == "Run1",
+      harmonic == "F0"
+    ) %>%
+    pull(recording_time) %>%
+    max()
+  
+  # Find closest matching time in Conventional condition
+  matching_time <- snr_data %>%
+    filter(
+      listener == 1,
+      condition == "Conv",
+      run == "Run1",
+      harmonic == "F0"
+    ) %>%
+    mutate(time_diff = abs(recording_time - rapid_max_time)) %>%
+    filter(time_diff == min(time_diff)) %>%
+    pull(recording_time) %>%
+    first()
+  
+  return(matching_time)
+}
+
+recording_time_match <- find_matching_recording_time(snr_data)
+```
+
+```{r prepare_analysis_data}
+# Prepare conventional FFR data for analysis
+prepare_conventional_data <- function(signal_data, recording_time_match) {
+  signal_data %>%
+    filter(
+      signal_noise == "Signal",
+      harmonic %in% HARMONICS_OF_INTEREST,
+      recording_time == recording_time_match,
+      condition == "Conv"
+    ) %>%
+    group_by(condition, run, harmonic) %>%
+    mutate(
+      mean_value = mean(data_value, na.rm = TRUE),
+      median_value = median(data_value, na.rm = TRUE)
+    ) %>%
+    ungroup() %>%
+    select(listener, run, condition, harmonic, data_value, mean_value, median_value)
+}
+
+# Prepare rapid FFR data for analysis
+prepare_rapid_data <- function(signal_data) {
+  signal_data %>%
+    filter(
+      signal_noise == "Signal",
+      harmonic %in% HARMONICS_OF_INTEREST,
+      iteration == TARGET_ITERATION_RAPID,
+      condition == "Rapid"
+    ) %>%
+    group_by(condition, run, harmonic) %>%
+    mutate(
+      mean_value = mean(data_value, na.rm = TRUE),
+      median_value = median(data_value, na.rm = TRUE)
+    ) %>%
+    ungroup() %>%
+    select(listener, run, condition, harmonic, data_value, mean_value, median_value)
+}
+
+rapid_data        <- prepare_rapid_data(signal_data)
+conventional_data <- prepare_conventional_data(signal_data, recording_time_match)
+```
+
+=============================================================================
+VISUALISATION
+=============================================================================
+
+```{r visualization_functions}
+# Create test-retest scatter plots with summary statistics
+create_test_retest_plot <- function(data, condition_name) {
+  # Prepare data for plotting
+  plot_data <- data %>%
+    select(listener, condition, run, harmonic, data_value) %>%
+    pivot_wider(names_from = "run", values_from = "data_value")
+  
+  # Calculate summary statistics
+  summary_stats <- plot_data %>%
+    group_by(harmonic) %>%
+    summarise(
+      sd_run1 = sd(Run1, na.rm = TRUE),
+      sd_run2 = sd(Run2, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    mutate(
+      label = paste0(
+        "SD Run 1: ", round(sd_run1, 3), 
+        "\nSD Run 2: ", round(sd_run2, 3)
+      )
+    )
+  
+  # Create plot
+  ggplot(plot_data, aes(x = Run1, y = Run2)) + 
+    geom_point(alpha = 0.7) +
+    geom_smooth(method = 'lm', se = TRUE, color = "blue") +
+    geom_abline(intercept = 0, slope = 1, color = "grey", linetype = "dashed", size = 0.5) +
+    geom_text(
+      data = summary_stats,
+      aes(x = 0.135, y = 0.01, label = label),
+      hjust = 0, vjust = 0, inherit.aes = FALSE, size = 2
+    ) +
+    facet_wrap(~harmonic, labeller = label_both) +
+    labs(
+      x = paste("Run 1", condition_name, "FFR RMS amplitude (μV RMS)"),
+      y = paste("Run 2", condition_name, "FFR RMS amplitude (μV RMS)"),
+      title = paste("Test-Retest Reliability:", condition_name)
+    ) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      strip.background = element_rect(fill = "lightgray")
+    )
+}
+```
+
+```{r create_plots}
+# Generate test-retest plots
+conventional_plot <- create_test_retest_plot(conventional_data, "Conventional")
+rapid_plot        <- create_test_retest_plot(rapid_data, "Rapid")
+
+# Display plots
+conventional_plot
+rapid_plot
+```
+
+=============================================================================
+ICC ANALYSIS
+=============================================================================
+
+```{r icc_functions}
+# Calculate ICC for a single condition and harmonic
+calculate_single_icc <- function(data, harmonic_num) {
+  icc_data <- data %>%
+    filter(harmonic == harmonic_num) %>%
+    select(Run1, Run2)
+  
+  if (nrow(icc_data) == 0) {
+    return(NULL)
+  }
+  
+  icc(icc_data, model = "twoway", type = "agreement")
+}
+
+# Calculate ICC for all harmonics in a condition
+calculate_condition_icc <- function(data, condition_name) {
+  # Prepare data in wide format
+  icc_data <- data %>%
+    select(listener, run, harmonic, data_value) %>%
+    pivot_wider(names_from = "run", values_from = "data_value") %>%
+    mutate(
+      harmonic = recode_factor(
+        harmonic,
+        "F0" = 1, "H2" = 2, "H3" = 3, "H4" = 4,
+        "H5" = 5, "H6" = 6, "H7" = 7
+      ),
+      harmonic = as.numeric(harmonic)
+    )
+  
+  # Calculate ICC for each harmonic
+  icc_results        <- map(1:7, ~ calculate_single_icc(icc_data, .x))
+  names(icc_results) <- paste0(condition_name, "_ICC_Harmonic_", 1:7)
+  
+  # Extract p-values for multiple comparison correction
+  p_values_raw       <- map_dbl(icc_results, ~ ifelse(is.null(.x), NA, .x$p.value))
+  p_values_adjusted  <- p.adjust(p_values_raw, method = 'holm', n = length(p_values_raw))
+  
+  return(list(
+    icc_results = icc_results,
+    p_values_raw = p_values_raw,
+    p_values_adjusted = p_values_adjusted
+  ))
+}
+```
+
+```{r run_icc_analysis}
+# Calculate ICC for both conditions
+rapid_icc_analysis        <- calculate_condition_icc(rapid_data, "Rapid")
+conventional_icc_analysis <- calculate_condition_icc(conventional_data, "Conv")
+
+# Display results
+cat("Rapid FFR ICC p-values (raw):\n")
+print(round(rapid_icc_analysis$p_values_raw, 4))
+cat("\nRapid FFR ICC p-values (Holm-adjusted):\n")
+print(round(rapid_icc_analysis$p_values_adjusted, 4))
+
+cat("\n\nConventional FFR ICC p-values (raw):\n")
+print(round(conventional_icc_analysis$p_values_raw, 4))
+cat("\nConventional FFR ICC p-values (Holm-adjusted):\n")
+print(round(conventional_icc_analysis$p_values_adjusted, 4))
+```
+
+=============================================================================
+PERMUTATUION TESTING
+=============================================================================
+
+```{r permutation_functions}
+# Perform permutation test comparing ICC values between conditions
+perform_permutation_test <- function(rapid_data, conventional_data, n_permutations = 1000) {
+  # Prepare data for permutation
+  rapid_wide <- rapid_data %>%
+    select(listener, run, harmonic, data_value) %>%
+    pivot_wider(names_from = "run", values_from = "data_value") %>%
+    mutate(condition = "Rapid") %>%
+    mutate(
+      harmonic = recode_factor(
+        harmonic,
+        "F0" = 1, "H2" = 2, "H3" = 3, "H4" = 4,
+        "H5" = 5, "H6" = 6, "H7" = 7
+      ),
+      harmonic = as.numeric(harmonic)
+    )
+  
+  conv_wide <- conventional_data %>%
+    select(listener, run, harmonic, data_value) %>%
+    pivot_wider(names_from = "run", values_from = "data_value") %>%
+    mutate(condition = "Conv") %>%
+    mutate(
+      harmonic = recode_factor(
+        harmonic,
+        "F0" = 1, "H2" = 2, "H3" = 3, "H4" = 4,
+        "H5" = 5, "H6" = 6, "H7" = 7
+      ),
+      harmonic = as.numeric(harmonic)
+    )
+  
+  # Initialise results matrices
+  n_harmonics              <- 7
+  bootstrapped_differences <- matrix(nrow = n_permutations, ncol = n_harmonics)
+  real_differences         <- numeric(n_harmonics)
+  
+  # Function to calculate ICC difference for a single harmonic
+  calculate_icc_difference <- function(harmonic_num, data_rapid, data_conv) {
+    rapid_icc <- calculate_single_icc(data_rapid, harmonic_num)
+    conv_icc  <- calculate_single_icc(data_conv, harmonic_num)
+    
+    if (is.null(rapid_icc) || is.null(conv_icc)) {
+      return(NA)
+    }
+    
+    return(rapid_icc$value - conv_icc$value)
+  }
+  
+  # Calculate real ICC differences
+  for (harmonic_It in 1:n_harmonics) {
+    real_differences[harmonic_It] <- calculate_icc_difference(harmonic_It, 
+                                                           rapid_wide, conv_wide
+    )
+    
+    # Perform permutation testing
+    # Get harmonic-specific data
+    harmonic_data_rapid <- rapid_wide %>% 
+      filter(harmonic == harmonic_It) %>%
+      select(Run1, Run2)
+      
+    harmonic_data_conv <- conv_wide %>% 
+      filter(harmonic == harmonic_It) %>%
+      select(Run1, Run2)
+    
+    for (perm_It in 1:n_permutations) {
+      set.seed(perm_It)
+      BootstrappedRapidRun1 <- sample (harmonic_data_rapid$Run1, 16, replace = FALSE)
+    
+      set.seed(perm_It+1001)
+      BootstrappedRapidRun2 <- sample (harmonic_data_rapid$Run2, 16, replace = FALSE)
+      
+      # Get the conv-boostrap, while matching listeners with the rapid by using the same seed
+      set.seed(perm_It)
+      BootstrappedConvRun1 <- sample (harmonic_data_conv$Run1, 16, replace = FALSE)
+    
+      set.seed(perm_It+1001)
+      BootstrappedConvRun2 <- sample (harmonic_data_conv$Run2, 16, replace = FALSE)
+      
+      # Compute the 2 ICCs, and then get the difference
+      BoostrappedRapidJoined <- cbind (BootstrappedRapidRun1, BootstrappedRapidRun2)
+      rapid_icc              <- icc(BoostrappedRapidJoined, model = "twoway", type = "agreement")
+      
+      BoostrappedConvJoined  <- cbind (BootstrappedConvRun1, BootstrappedConvRun2)
+      conv_icc               <- icc(BoostrappedConvJoined, model = "twoway", type = "agreement")
+      
+      bootstrapped_differences[perm_It, harmonic_It] <- rapid_icc$value - conv_icc$value
+    }
+  }
+  
+  # Calculate p-values
+  p_values_two_tailed <- sapply(1:n_harmonics, function(harmonic_It) {
+    sum(abs(real_differences[harmonic_It]) < 
+          abs(bootstrapped_differences[, harmonic_It])) / n_permutations
+  })
+  
+  # Calculate confidence intervals
+  confidence_intervals <- sapply(1:n_harmonics, function(harmonic_It) {
+    quantile(bootstrapped_differences[, harmonic_It], c(0.025, 0.975))
+    })
+  
+  return(list(
+    real_differences = real_differences,
+    bootstrapped_differences = bootstrapped_differences,
+    p_values_two_tailed = p_values_two_tailed,
+    confidence_intervals = confidence_intervals
+  ))
+}
+```
+
+```{r run_permutation_test}
+# Perform permutation test
+permutation_results <- perform_permutation_test(rapid_data, conventional_data, 1000)
+
+cat("Permutation test results (two-tailed p-values):\n")
+print(round(permutation_results$p_values_two_tailed, 4))
+
+cat("\nReal ICC differences (Rapid - Conventional):\n")
+print(round(permutation_results$real_differences, 4))
+```
+
+=============================================================================
+PERMUTATUION TESTING VISUALISATION
+=============================================================================
+
+```{r visualisation_permutation}
+# Create permutation test histograms
+create_permutation_plots <- function(permutation_results) {
+  n_harmonics <- ncol(permutation_results$bootstrapped_differences)
+  
+  plot_list <- map(1:n_harmonics, function(h) {
+    # Prepare data for plotting
+    boot_data <- data.frame(
+      differences = permutation_results$bootstrapped_differences[, h]
+    )
+    
+    # Get confidence intervals and real difference
+    ci_lower   <- permutation_results$confidence_intervals[1, h]
+    ci_upper   <- permutation_results$confidence_intervals[2, h]
+    real_diff  <- permutation_results$real_differences[h]
+    p_val      <- permutation_results$p_values_two_tailed[h]
+    
+    # Create plot
+    ggplot(boot_data, aes(x = differences)) +
+      geom_density(fill = "lightblue", alpha = 0.7) +
+      geom_vline(xintercept = ci_lower, linetype = "dotted", color = "black", size = 0.5) +
+      geom_vline(xintercept = ci_upper, linetype = "dotted", color = "black", size = 0.5) +
+      geom_vline(xintercept = real_diff, linetype = "solid", color = "red", size = 1) +
+      labs(
+        x = "Rapid ICC - Conventional ICC",
+        y = "Density",
+        title = paste("Harmonic", h, "- p =", round(p_val, 4)),
+        subtitle = paste("Real difference:", round(real_diff, 4))
+      ) +
+      theme_bw() +
+      theme(
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5)
+      )
+  })
+  
+  return(plot_list)
+}
+
+# Generate and display permutation plots
+permutation_plots <- create_permutation_plots(permutation_results)
+
+# Display plots
+walk(permutation_plots, print)
+```
+
+=============================================================================
+SUMMARY
+=============================================================================
+
+```{r summary_tables}
+# Create publication-ready ICC summary table
+create_icc_summary_table <- function(icc_analysis, condition_name) {
+  icc_values <- map_dbl(icc_analysis$icc_results, ~ ifelse(is.null(.x), NA, .x$value))
+  ci_lower   <- map_dbl(icc_analysis$icc_results, ~ ifelse(is.null(.x), NA, .x$lbound))
+  ci_upper   <- map_dbl(icc_analysis$icc_results, ~ ifelse(is.null(.x), NA, .x$ubound))
+  df1        <- map_dbl(icc_analysis$icc_results, ~ ifelse(is.null(.x), NA, .x$df1))
+  df2        <- map_dbl(icc_analysis$icc_results, ~ ifelse(is.null(.x), NA, .x$df2))
+  
+  harmonic_labels <- c("F0 (EFR)", "H2 (EFR)", "H3 (EFR)", "H4 (TFS)", 
+                      "H5 (TFS)", "H6 (TFS)", "H7 (TFS)")
+  
+  data.frame(
+    Condition        = condition_name,
+    Harmonic         = harmonic_labels,
+    ICC              = round(icc_values, 3),
+    CI_Lower         = round(ci_lower, 3),
+    CI_Upper         = round(ci_upper, 3),
+    DF1              = round(df1, 0),
+    DF2              = round(df2, 0),
+    p_value_raw      = round(icc_analysis$p_values_raw, 4),
+    p_value_adjusted = round(icc_analysis$p_values_adjusted, 4)
+  )
+}
+
+# Create summary tables
+rapid_summary <- create_icc_summary_table(rapid_icc_analysis, "Rapid")
+conv_summary <- create_icc_summary_table(conventional_icc_analysis, "Conventional")
+
+# Display tables
+cat("Rapid FFR ICC Summary:\n")
+print(rapid_summary)
+
+cat("\n\nConventional FFR ICC Summary:\n")
+print(conv_summary)
+```
+
+=============================================================================
+SESSION INFORMATION
+=============================================================================
+
+```{r session_info}
+# Document the R session for reproducibility
+sessionInfo()
+```

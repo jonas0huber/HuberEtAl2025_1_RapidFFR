@@ -1,0 +1,436 @@
+---
+title: "Conv - Rapid Correlation Analysis"
+author: "Jonas"
+date: "2025-03-22"
+output: html_document
+---
+
+Performs correlation and Intraclass Correlation Coefficient (ICC) analyses to assess the agreement between Rapid and Conventional FFR recording methods.
+Research Question 2: How strongly are Rapid and Conventional FFR responses correlated?
+
+=============================================================================
+SETUP AND CONFIGURATION
+=============================================================================
+
+```{r setup, include=FALSE}
+# Clear workspace for clean start
+rm(list = ls())
+
+# Load required libraries with error handling
+required_packages <- c("tidyverse", "broom", "irr")
+
+lapply(required_packages, function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+})
+
+# Set global constants
+HARMONICS_OF_INTEREST <- c("F0", "H2", "H3", "H4", "H5", "H6", "H7")
+HARMONIC_LABELS       <- c("F0 (EFR)", "H2 (EFR)", "H3 (EFR)", "H4 (TFS)", 
+                           "H5 (TFS)", "H6 (TFS)", "H7 (TFS)")
+TARGET_RUN            <- "Run1"
+TARGET_ITERATION      <- 100
+```
+
+=============================================================================
+DATA LOADING AND PREPROCESSING
+=============================================================================
+
+```{r data_loading}
+# Define file paths (consider using here::here() for better path management)
+DATA_PATH   <- "./input/"
+SNR_FILE    <- "SNRIterationsMatrixClean.csv"
+SIGNAL_FILE <- "SignalIterationsMatrixClean.csv"
+
+# Load and preprocess SNR data
+load_and_clean_data <- function(file_path) {
+  data <- read_csv(file_path, show_col_types = FALSE) 
+  return(data)
+}
+
+snr_data_raw    <- load_and_clean_data(file.path(DATA_PATH, SNR_FILE))
+signal_data_raw <- load_and_clean_data(file.path(DATA_PATH, SIGNAL_FILE))
+
+# Calculate time matching between Rapid and Conventional conditions
+# This ensures fair comparison by matching recording durations
+calculate_time_matching <- function(data) {
+  
+  # Get maximum recording time for Rapid condition
+  rapid_max_time <- data %>%
+    filter(listener  == 1, 
+           condition == "Rapid", 
+           run       == "Run1", 
+           harmonic  == "F0") %>%
+    pull(recording_time) %>%
+    max(na.rm = TRUE)
+  
+  # Find closest matching time point in Conventional condition
+  conv_matching_times <- data %>%
+    filter(listener   == 1, 
+           condition  == "Conv", 
+           run        == "Run1", 
+           harmonic   == "F0") %>%
+    mutate(time_diff  = abs(recording_time - rapid_max_time)) %>%
+    filter(time_diff  == min(time_diff, na.rm = TRUE))
+  
+  recording_time_match   <- conv_matching_times$recording_time[1]
+  stimulation_time_match <- conv_matching_times$stimulation_time[1]
+  
+  return(list(
+    rapid_max_time         = rapid_max_time,
+    recording_time_match   = recording_time_match,
+    stimulation_time_match = stimulation_time_match
+  ))
+}
+
+time_matching <- calculate_time_matching(snr_data_raw)
+```
+
+=============================================================================
+UTILITY FUNCTIONS
+=============================================================================
+
+```{r utility_functions}
+# Function to convert harmonic names to numeric values
+convert_harmonics_to_numeric <- function(data) {
+  data %>%
+    mutate(
+      harmonic = recode_factor(
+        harmonic,
+        "F0" = 1, "H2" = 2, "H3" = 3, "H4" = 4,
+        "H5" = 5, "H6" = 6, "H7" = 7
+      ),
+      harmonic = as.numeric(harmonic)
+    )
+}
+
+# Function to prepare statistics data
+prepare_stats_data <- function(data, signal_filter = NULL) {
+  filtered_data <- data %>%
+    filter(
+      harmonic %in% HARMONICS_OF_INTEREST,
+      run == TARGET_RUN,
+      (condition == "Rapid" & iteration == TARGET_ITERATION) |
+      (condition == "Conv" & iteration == TARGET_ITERATION)
+    )
+  
+  # Apply signal filter if provided
+  if (!is.null(signal_filter)) {
+    filtered_data <- filtered_data %>%
+      filter(signal_noise == signal_filter)
+  }
+  
+  filtered_data %>%
+    convert_harmonics_to_numeric() %>%
+    group_by(condition, run, harmonic) %>%
+    mutate(
+      mean_value = mean(data_value, na.rm = TRUE),
+      median_value = median(data_value, na.rm = TRUE)
+    ) %>%
+    ungroup() %>%
+    select(listener, run, condition, harmonic, data_value, mean_value, median_value)
+}
+
+# Function to create correlation plot
+create_correlation_plot <- function(data, x_label, y_label, x_pos = -15, y_pos = 19) {
+  # Calculate summary statistics
+  summary_stats <- data %>%
+    group_by(harmonic) %>%
+    summarise(
+      sd_conv = sd(Conv, na.rm = TRUE),
+      sd_rapid = sd(Rapid, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      label = paste0("SD for Conv: ", round(sd_conv, 3), 
+                    "\nSD for Rapid: ", round(sd_rapid, 3))
+    )
+  
+  # Create plot
+  ggplot(data, aes(x = Rapid, y = Conv)) +
+    geom_point() +
+    geom_smooth(method = "lm") +
+    geom_abline(intercept = 0, slope = 1, color = "grey", 
+                linetype = "dashed", size = 0.5) +
+    scale_x_continuous(name = x_label) +
+    scale_y_continuous(name = y_label) +
+    geom_text(
+      data = summary_stats,
+      aes(x = x_pos, y = y_pos, label = label),
+      hjust = 0, vjust = 0, inherit.aes = FALSE, size = 2
+    ) +
+    facet_wrap(~harmonic) +
+    theme_bw()
+}
+
+# Function to calculate ICC for a single harmonic
+calculate_harmonic_icc <- function(data, harmonic_num) {
+  harmonic_data <- data %>%
+    filter(harmonic == harmonic_num) %>%
+    select(Rapid, Conv)
+  
+  if (nrow(harmonic_data) == 0) {
+    warning(paste("No data found for harmonic", harmonic_num))
+    return(NULL)
+  }
+  
+  icc(harmonic_data, model = "oneway")
+} #return??
+
+# Function to extract ICC results in a structured format
+extract_icc_results <- function(icc_result) {
+  if (is.null(icc_result)) {
+    return(list(value = NA, df1 = NA, df2 = NA, lbound = NA, ubound = NA, p.value = NA))
+  }
+  
+  list(
+    value = icc_result$value,
+    df1 = icc_result$df1,
+    df2 = icc_result$df2,
+    lbound = icc_result$lbound,
+    ubound = icc_result$ubound,
+    p.value = icc_result$p.value
+  )
+}
+```
+
+=============================================================================
+DATA PREPARATION
+=============================================================================
+
+```{r data_preparation}
+# Prepare SNR statistics data
+snr_stats_data <- prepare_stats_data(snr_data_raw)
+
+# Prepare Signal statistics data  
+signal_stats_data <- prepare_stats_data(signal_data_raw, "Signal")
+
+cat("Data preparation completed:\n")
+cat("SNR data dimensions:", dim(snr_stats_data), "\n")
+cat("Signal data dimensions:", dim(signal_stats_data), "\n")
+```
+
+=============================================================================
+CORRELATION AND VISUALISATIONS
+=============================================================================
+
+```{r correlation_plots}
+# Prepare data for correlation plots
+snr_correlation_data <- snr_stats_data %>%
+  select(listener, condition, harmonic, data_value) %>%
+  pivot_wider(names_from = condition, values_from = data_value)
+
+signal_correlation_data <- signal_stats_data %>%
+  select(listener, condition, harmonic, data_value) %>%
+  pivot_wider(names_from = condition, values_from = data_value)
+
+# Create SNR correlation plot
+snr_correlation_plot <- create_correlation_plot(
+  snr_correlation_data,
+  "Rapid FFR SNR (dB)",
+  "Conventional FFR SNR (dB)",
+  x_pos = -15, y_pos = 19
+)
+
+# Create Signal correlation plot
+signal_correlation_plot <- create_correlation_plot(
+  signal_correlation_data,
+  "Rapid FFR RMS amplitude (μV RMS)",
+  "Conventional FFR RMS amplitude (μV RMS)",
+  x_pos = 0.135, y_pos = 0.01
+)
+
+# Display plots
+snr_correlation_plot
+signal_correlation_plot
+```
+
+=============================================================================
+ICC ANALYSIS FOR SIGNAL DATA
+=============================================================================
+
+```{r icc_analysis}
+# Calculate ICC for all harmonics using lapply instead of for loop
+icc_results <- lapply(1:7, function(i) {
+  calculate_harmonic_icc(signal_correlation_data, i)
+})
+
+# Name the results for easier access
+names(icc_results) <- paste0("ICCHarmonic", 1:7)
+
+# Extract p-values for multiple comparison correction
+p_values <- sapply(icc_results, function(x) {
+  if (is.null(x)) NA else x$p.value
+})
+
+# Apply Holm correction for multiple comparisons
+adjusted_p_values <- p.adjust(p_values, method = "holm", n = length(p_values))
+
+# Display results
+cat("Original p-values:\n")
+round(p_values, 4)
+cat("\nHolm-adjusted p-values:\n")
+round(adjusted_p_values, 4)
+
+# Extract structured results for all harmonics
+icc_summary <- map_dfr(1:7, function(i) {
+  result <- extract_icc_results(icc_results[[i]])
+  tibble(
+    Harmonic = i,
+    Harmonic_Label = HARMONIC_LABELS[i],
+    ICC_Value = result$value,
+    DF1 = result$df1,
+    DF2 = result$df2,
+    CI_Lower = result$lbound,
+    CI_Upper = result$ubound,
+    P_Value = result$p.value,
+    P_Value_Adjusted = adjusted_p_values[i]
+  )
+})
+
+# Display summary table
+icc_summary
+```
+
+=============================================================================
+RESULTS TABLE
+=============================================================================
+
+```{r results_table}
+# Generate formatted results table for LaTeX/publication
+generate_latex_table <- function(icc_summary) {
+  icc_summary %>%
+    mutate(
+      ICC_Formatted = round(ICC_Value, 3),
+      DF_Formatted = paste0("[", round(DF1, 0), ", ", round(DF2, 0), "]"),
+      CI_Formatted = paste0("[", round(CI_Lower, 3), ", ", round(CI_Upper, 3), "]"),
+      P_Formatted = round(P_Value, 3),
+      P_Adj_Formatted = round(P_Value_Adjusted, 3)
+    ) %>%
+    select(Harmonic_Label, ICC_Formatted, DF_Formatted, CI_Formatted, 
+           P_Formatted, P_Adj_Formatted)
+}
+
+latex_table <- generate_latex_table(icc_summary)
+latex_table
+
+# Create publication-ready table
+cat("\nPublication-ready LaTeX table rows:\n")
+for (i in 1:nrow(latex_table)) {
+  cat(paste0(
+    latex_table$Harmonic_Label[i], " & ",
+    latex_table$ICC_Formatted[i], " & ",
+    latex_table$DF_Formatted[i], " & ",
+    latex_table$CI_Formatted[i], " & ",
+    latex_table$P_Formatted[i], " & ",
+    latex_table$P_Adj_Formatted[i], " \\\\ \n"
+  ))
+}
+```
+
+=============================================================================
+ADDITIONAL ANALYSIS
+=============================================================================
+
+```{r diagnostic_analysis}
+# Create diagnostic scatter plots for each harmonic
+diagnostic_plots <- map(1:7, function(i) {
+  harmonic_data <- signal_correlation_data %>%
+    filter(harmonic == i)
+  
+  if (nrow(harmonic_data) == 0) return(NULL)
+  
+  ggplot(harmonic_data, aes(x = Rapid, y = Conv)) +
+    geom_point(alpha = 0.7) +
+    geom_smooth(method = "lm", se = TRUE) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    labs(
+      title = paste("Harmonic", i, "-", HARMONIC_LABELS[i]),
+      x = "Rapid FFR (μV RMS)",
+      y = "Conventional FFR (μV RMS)"
+    ) +
+    theme_bw()
+})
+
+# Display individual diagnostic plots
+walk(diagnostic_plots, print)
+
+# Calculate additional correlation statistics
+correlation_stats <- map_dfr(1:7, function(i) {
+  harmonic_data <- signal_correlation_data %>%
+    filter(harmonic == i) %>%
+    select(Rapid, Conv) %>%
+    drop_na()
+  
+  if (nrow(harmonic_data) < 3) {
+    return(tibble(Harmonic = i, Correlation = NA, P_Value = NA, N = 0))
+  }
+  
+  cor_test <- cor.test(harmonic_data$Rapid, harmonic_data$Conv)
+  
+  tibble(
+    Harmonic = i,
+    Harmonic_Label = HARMONIC_LABELS[i],
+    Correlation = cor_test$estimate,
+    P_Value = cor_test$p.value,
+    CI_Lower = cor_test$conf.int[1],
+    CI_Upper = cor_test$conf.int[2],
+    N = nrow(harmonic_data)
+  )
+})
+
+cat("\nPearson Correlation Results:\n")
+correlation_stats
+```
+
+=============================================================================
+SUMMARY
+=============================================================================
+
+```{r summary}
+# Combine ICC and correlation results
+combined_results <- icc_summary %>%
+  left_join(correlation_stats, by = c("Harmonic", "Harmonic_Label")) %>%
+  select(
+    Harmonic_Label, N, ICC_Value, CI_Lower.x, CI_Upper.x, P_Value.x,
+    Correlation, CI_Lower.y, CI_Upper.y, P_Value.y, P_Value_Adjusted
+  ) %>%
+  rename(
+    ICC = ICC_Value,
+    ICC_CI_Lower = CI_Lower.x,
+    ICC_CI_Upper = CI_Upper.x,
+    ICC_P_Value = P_Value.x,
+    Correlation_CI_Lower = CI_Lower.y,
+    Correlation_CI_Upper = CI_Upper.y,
+    Correlation_P_Value = P_Value.y,
+    ICC_P_Adjusted = P_Value_Adjusted
+  )
+
+cat("\nCombined Results Summary:\n")
+combined_results
+
+# Identify significant results
+significant_icc <- combined_results %>%
+  filter(ICC_P_Adjusted < 0.05) %>%
+  pull(Harmonic_Label)
+
+significant_correlation <- combined_results %>%
+  filter(Correlation_P_Value < 0.05) %>%
+  pull(Harmonic_Label)
+
+cat("\nSignificant ICC results (adjusted p < 0.05):", 
+    if(length(significant_icc) > 0) paste(significant_icc, collapse = ", ") else "None", "\n")
+cat("Significant correlations (p < 0.05):", 
+    if(length(significant_correlation) > 0) paste(significant_correlation, collapse = ", ") else "None", "\n")
+```
+
+=============================================================================
+SESSION INFORMATION
+=============================================================================
+
+```{r session_info}
+# Print session information for reproducibility
+sessionInfo()
+```

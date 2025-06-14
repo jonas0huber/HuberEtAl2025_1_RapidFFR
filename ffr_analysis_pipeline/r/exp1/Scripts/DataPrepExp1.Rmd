@@ -1,0 +1,482 @@
+---
+title: "FFR Data Matrix Creation"
+author: "Jonas Huber"
+date: "2024-06-12"
+output: html_document
+---
+
+Processes pre-cleaned FFR datasets collected using Rapid and Conventional methods. The input data was preprocessed in additive iterations, and this script prepares it for downstream analysis.
+
+============================================================================
+SETUP AND DEPENDENCIES
+============================================================================
+
+```{r setup, include=FALSE}
+# Clear workspace for clean start
+rm(list = ls())
+
+# Load required libraries
+# Load required libraries with error handling
+required_packages <- c("tidyverse")
+
+lapply(required_packages, function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+})
+```
+
+============================================================================
+CONFIGURATION AND CONSTANTS
+============================================================================
+
+```{r config}
+# Study parameters
+PARTICIPANT_IDS      <- 1:16
+N_RUNS               <- 2
+N_CONDITIONS         <- 2  # rapid and conventional
+OUTLIER_SD_THRESHOLD <- 2.5  # Standard deviations for outlier detection
+
+# File path configuration
+BASE_DIR       <- " ./input/"
+RAPID_DATA_DIR <- file.path(BASE_DIR, "Data/RapidIterations")
+CONV_DATA_DIR  <- file.path(BASE_DIR, "Data/ConvIterations")
+OUTPUT_DIR     <- file.path(BASE_DIR, "Data")
+SCRIPT_DIR     <- file.path(BASE_DIR, "Scripts")
+
+# File naming patterns
+RAPID_PREFIX        <- "TimRapidIterationsERPData_Part"
+CONV_PREFIX         <- "TimConvIterationsERPData_Part"
+VALUES_SUFFIX       <- "Values.csv"
+SIGNAL_NOISE_SUFFIX <- "SignalNoiseValues.csv"
+```
+
+============================================================================
+DATA LOADING FUNCTIONS
+============================================================================
+
+```{r data_loading_functions}
+#' Load ERP data files for a specific participant and run
+#' @param participant_id Participant identifier
+#' @param run_number Run number (1 or 2)
+#' @param data_type Type of data ('rapid' or 'conv')
+#' @param file_suffix File suffix ('Values.csv' or 'SignalNoiseValues.csv')
+#' @return Data frame with loaded data
+load_erp_file <- function(participant_id, run_number, data_type, file_suffix) {
+  # Set appropriate directory and prefix
+  if (data_type == "rapid") {
+    setwd(RAPID_DATA_DIR)
+    prefix <- RAPID_PREFIX
+  } else {
+    setwd(CONV_DATA_DIR)
+    prefix <- CONV_PREFIX
+  }
+  
+  # Construct filename
+  filename <- paste0(prefix, participant_id, "Run", run_number, file_suffix)
+  
+  # Load and return data
+  tryCatch({
+    read_csv(filename, col_names = FALSE, show_col_types = FALSE)
+  }, error = function(e) {
+    warning(paste("Failed to load file:", filename))
+    return(NULL)
+  })
+}
+
+#' Load all ERP data files for all participants
+#' @return List containing all loaded data frames
+load_all_erp_data <- function() {
+  message("Loading ERP data files...")
+  
+  # Create parameter grid for all combinations
+  param_grid <- expand.grid(
+    participant      = PARTICIPANT_IDS,
+    run              = 1:N_RUNS,
+    data_type        = c("rapid", "conv"),
+    file_type        = c("values", "signal"),
+    stringsAsFactors = FALSE
+  )
+  
+  # Function to load single file based on parameters
+  load_single_file <- function(i) {
+    params         <- param_grid[i, ]
+    file_suffix    <- ifelse(params$file_type == "values", VALUES_SUFFIX, SIGNAL_NOISE_SUFFIX)
+    data           <- load_erp_file(params$participant, params$run, params$data_type, file_suffix)
+    
+    # Create descriptive name
+    key_name <- paste0(params$data_type, "_", params$file_type, "_p", params$participant, "_r", params$run)
+    return(list(key = key_name, data = data))
+  }
+  
+  # Load all files using lapply
+  file_results <- lapply(1:nrow(param_grid), load_single_file)
+  
+  # Convert to named list
+  data_storage <- setNames(
+    lapply(file_results, function(x) x$data),
+    sapply(file_results, function(x) x$key)
+  )
+  
+  message("Data loading completed.")
+  return(data_storage)
+}
+```
+
+============================================================================
+DATA PROCESSING FUNCTIONS
+============================================================================
+
+```{r data_processing_functions}
+#' Process signal/noise data into long format
+#' @param data_list List of loaded data frames
+#' @return Processed data frame in long format
+process_signal_noise_data <- function(data_list) {
+  message("Processing signal/noise data...")
+  
+  # Get dimensions from first rapid values file
+  first_file   <- data_list[[paste0("rapid_values_p1_r1")]]
+  n_harmonics  <- as.numeric(first_file[1, 1])
+  n_iterations <- nrow(first_file)
+  
+  # Create parameter grid for all combinations
+  param_combinations <- expand.grid(
+    participant       = PARTICIPANT_IDS,
+    signal_noise_type = 1:2,             # 1 = Signal, 2 = Noise
+    run               = 1:N_RUNS,
+    condition         = 1:N_CONDITIONS,  # 1 = Rapid, 2 = Conv
+    iteration         = 1:n_iterations,
+    harmonic          = 1:n_harmonics,
+    stringsAsFactors  = FALSE
+  )
+  
+  # Function to process single combination
+  process_single_combination <- function(single_combination) {
+    params <- param_combinations[single_combination, ]
+    
+    # Determine condition and column index
+    condition_name <- if (params$condition == 1) "rapid" else "conv"
+    col_index      <- if (params$signal_noise_type == 1) params$harmonic + 1 else params$harmonic + n_harmonics + 1
+    
+    # Get data from appropriate file
+    data_key     <- paste0(condition_name, "_signal_p", params$participant, "_r", params$run)
+    current_data <- data_list[[data_key]]
+    
+    if (!is.null(current_data) && 
+        params$iteration <= nrow(current_data) && 
+        col_index        <= ncol(current_data)) {
+      
+      data_value <- current_data[params$iteration, col_index]
+      
+      return(tibble(
+        listener      = params$participant,
+        signal_noise  = params$signal_noise_type,
+        run           = params$run,
+        condition     = params$condition,
+        iteration     = params$iteration,
+        harmonic      = params$harmonic,
+        data_value    = as.numeric(data_value)
+      ))
+    }
+    return(NULL)
+  }
+  
+  # Process all combinations using lapply
+  results_list <- lapply(1:nrow(param_combinations), process_single_combination)
+  
+  # Remove NULL results and combine
+  valid_results <- results_list[!sapply(results_list, is.null)]
+  results       <- bind_rows(valid_results)
+  
+  # Apply factor labels and calculate time variables
+  results <- results %>%
+    mutate(
+      # Convert to factors with meaningful labels
+      harmonic = factor(harmonic, 
+                       levels = 1:7, 
+                       labels = c("F0", "H2", "H3", "H4", "H5", "H6", "H7")),
+      listener = factor(listener),
+      signal_noise = factor(signal_noise, 
+                           levels = 1:2, 
+                           labels = c("Signal", "Noise")),
+      condition = factor(condition, 
+                        levels = 1:2, 
+                        labels = c("Rapid", "Conv")),
+      run = factor(run, 
+                  levels = 1:2, 
+                  labels = c("Run1", "Run2")),
+      
+      # Calculate timing variables
+      recording_time = case_when(
+        str_starts(condition, "C") ~ iteration * (5/100),
+        str_starts(condition, "R") ~ iteration * (1.933333/100)
+      ),
+      stimulation_time = case_when(
+        str_starts(condition, "C") ~ iteration * (2.734375/100),
+        str_starts(condition, "R") ~ iteration * (1.933333/100)
+      )
+    )
+  
+  message("Signal/noise data processing completed.")
+  return(results)
+}
+
+
+#' Process SNR data with p-values into long format
+#' @param data_list List of loaded data frames
+#' @return Processed data frame in long format
+process_snr_data <- function(data_list) {
+  message("Processing SNR data...")
+  
+  # Get dimensions from first rapid values file
+  first_file   <- data_list[[paste0("rapid_values_p1_r1")]]
+  n_harmonics  <- as.numeric(first_file[1, 1]) + 2  # Additional harmonics for RMS values
+  n_iterations <- nrow(first_file)
+  
+  # Create parameter grid for all combinations
+  param_combinations <- expand.grid(
+    participant       = PARTICIPANT_IDS,
+    run               = 1:N_RUNS,
+    condition         = 1:N_CONDITIONS,
+    iteration         = 1:n_iterations,
+    harmonic          = 1:n_harmonics,
+    stringsAsFactors  = FALSE
+  )
+  
+  # Function to process single combination
+  process_single_combination <- function(i) {
+    params <- param_combinations[i, ]
+    
+    # Determine condition name
+    condition_name <- if (params$condition == 1) "rapid" else "conv"
+    
+    # Get data from appropriate file
+    data_key     <- paste0(condition_name, "_values_p", params$participant, "_r", params$run)
+    current_data <- data_list[[data_key]]
+    
+    if (!is.null(current_data) && params$iteration <= nrow(current_data)) {
+      data_value <- current_data[params$iteration, params$harmonic + 1]
+      
+      # Get p-value if available (only for first 7 harmonics)
+      p_value <- if (params$harmonic <= n_harmonics - 2 && (params$harmonic + 10) <= ncol(current_data)) {
+        as.numeric(current_data[params$iteration, params$harmonic + 10]) + 0.000001
+      } else {
+        NA
+      }
+      
+      return(tibble(
+        listener       = params$participant,
+        run            = params$run,
+        condition      = params$condition,
+        iteration      = params$iteration,
+        harmonic       = params$harmonic,
+        data_value     = as.numeric(data_value),
+        p_value        = p_value
+      ))
+    }
+    return(NULL)
+  }
+  
+  # Process all combinations using lapply
+  results_list <- lapply(1:nrow(param_combinations), process_single_combination)
+  
+  # Remove NULL results and combine
+  valid_results <- results_list[!sapply(results_list, is.null)]
+  results       <- bind_rows(valid_results)
+  
+  # Apply factor labels and calculate time variables
+  results <- results %>%
+    mutate(
+      # Convert to factors with meaningful labels
+      harmonic = factor(harmonic, 
+                       levels = 1:9, 
+                       labels = c("F0", "H2", "H3", "H4", "H5", "H6", "H7", "RMSFull", "RMSHarmonic")),
+      listener = factor(listener),
+      condition = factor(condition, 
+                        levels = 1:2, 
+                        labels = c("Rapid", "Conv")),
+      run = factor(run, 
+                  levels = 1:2, 
+                  labels = c("Run1", "Run2")),
+      
+      # Calculate timing variables
+      recording_time = case_when(
+        str_starts(condition, "C") ~ iteration * (5/100),
+        str_starts(condition, "R") ~ iteration * (1.933333/100)
+      ),
+      stimulation_time = case_when(
+        str_starts(condition, "C") ~ iteration * (2.734375/100),
+        str_starts(condition, "R") ~ iteration * (1.933333/100)
+      )
+    )
+  
+  message("SNR data processing completed.")
+  return(results)
+}
+
+```
+
+============================================================================
+OUTLIER DETECTION FUNCTIONS
+============================================================================
+
+```{r outlier_detection_functions}
+#' Detect outliers in SNR data using standard deviation threshold
+#' @param data Data frame with SNR values
+#' @param sd_threshold Number of standard deviations for outlier detection
+#' @return Data frame containing only outlier observations
+detect_snr_outliers <- function(data, sd_threshold = OUTLIER_SD_THRESHOLD) {
+  message("Detecting SNR outliers...")
+  
+  outliers <- data %>%
+    group_by(run, condition, iteration, harmonic) %>%
+    summarise(
+      mean_snr = mean(data_value, na.rm = TRUE),
+      sd_snr   = sd(data_value, na.rm = TRUE),
+      .groups  = "keep"
+    ) %>%
+    mutate(
+      lower_bound = mean_snr - sd_threshold * sd_snr,
+      upper_bound = mean_snr + sd_threshold * sd_snr
+    ) %>%
+    select(run, condition, iteration, harmonic, lower_bound, upper_bound) %>%
+    left_join(data, by = c("run", "condition", "iteration", "harmonic")) %>%
+    filter(data_value < lower_bound | data_value > upper_bound) %>%
+    select(-lower_bound, -upper_bound)
+  
+  message(paste("Found", nrow(outliers), "SNR outliers"))
+  return(outliers)
+}
+
+#' Detect outliers in signal/noise data using standard deviation threshold
+#' @param data Data frame with signal/noise values
+#' @param sd_threshold Number of standard deviations for outlier detection
+#' @return Data frame containing only outlier observations
+detect_signal_outliers <- function(data, sd_threshold = OUTLIER_SD_THRESHOLD) {
+  message("Detecting signal/noise outliers...")
+  
+  outliers <- data %>%
+    group_by(run, condition, iteration, harmonic, signal_noise) %>%
+    summarise(
+      mean_snr = mean(data_value, na.rm = TRUE),
+      sd_snr   = sd(data_value, na.rm = TRUE),
+      .groups  = "keep"
+    ) %>%
+    mutate(
+      lower_bound = mean_snr - sd_threshold * sd_snr,
+      upper_bound = mean_snr + sd_threshold * sd_snr
+    ) %>%
+    select(run, condition, iteration, harmonic, signal_noise, lower_bound, upper_bound) %>%
+    left_join(data, by = c("run", "condition", "iteration", "harmonic", "signal_noise")) %>%
+    filter(data_value < lower_bound | data_value > upper_bound) %>%
+    select(-lower_bound, -upper_bound)
+  
+  message(paste("Found", nrow(outliers), "signal/noise outliers"))
+  return(outliers)
+}
+```
+
+============================================================================
+DATA EXPORT FUNCTIONS
+============================================================================
+
+```{r data_extport_functions}
+#' Save processed data to CSV files
+#' @param snr_data Processed SNR data
+#' @param signal_data Processed signal/noise data
+#' @param snr_outliers SNR outlier data
+#' @param signal_outliers Signal/noise outlier data
+save_processed_data <- function(snr_data, signal_data, snr_outliers, signal_outliers) {
+  message("Saving processed data...")
+  
+  # Set working directory
+  setwd(OUTPUT_DIR)
+  
+  # Save original processed data
+  write_csv(snr_data, "SNRIterationsMatrix.csv")
+  write_csv(signal_data, "SignalIterationsMatrix.csv")
+  
+  # Remove outliers and save clean data
+  snr_clean    <- anti_join(snr_data, snr_outliers, 
+                        by = names(snr_outliers)[names(snr_outliers) %in% names(snr_data)])
+  signal_clean <- anti_join(signal_data, signal_outliers,
+                           by = names(signal_outliers)[names(signal_outliers) %in% names(signal_data)])
+  
+  write_csv(snr_clean, "SNRIterationsMatrixClean.csv")
+  write_csv(signal_clean, "SignalIterationsMatrixClean.csv")
+  
+  # Save outlier data for inspection
+  write_csv(snr_outliers, "SNR_Outliers.csv")
+  write_csv(signal_outliers, "Signal_Outliers.csv")
+  
+  message("Data saving completed.")
+  
+  # Return summary statistics
+  return(list(
+    snr_original_rows       = nrow(snr_data),
+    snr_clean_rows          = nrow(snr_clean),
+    snr_outliers_removed    = nrow(snr_outliers),
+    signal_original_rows    = nrow(signal_data),
+    signal_clean_rows       = nrow(signal_clean),
+    signal_outliers_removed = nrow(signal_outliers)
+  ))
+}
+
+```
+
+============================================================================
+MAIN EXECUTION PIPELINE
+============================================================================
+
+```{r main}
+main <- function() {
+  # Load all data
+  erp_data        <- load_all_erp_data()
+  
+  # Process signal/noise data
+  signal_matrix   <- process_signal_noise_data(erp_data)
+  
+  # Process SNR data
+  snr_matrix      <- process_snr_data(erp_data)
+  
+  # Detect outliers
+  snr_outliers    <- detect_snr_outliers(snr_matrix)
+  signal_outliers <- detect_signal_outliers(signal_matrix)
+  
+  # Save all processed data
+  summary_stats   <- save_processed_data(snr_matrix, signal_matrix, snr_outliers, signal_outliers)
+  
+  # Print summary
+  message("\n=== PROCESSING SUMMARY ===")
+  message(paste("SNR data: processed", summary_stats$snr_original_rows, "rows,", 
+                summary_stats$snr_outliers_removed, "outliers removed"))
+  message(paste("Signal data: processed", summary_stats$signal_original_rows, "rows,", 
+                summary_stats$signal_outliers_removed, "outliers removed"))
+  
+  # Clean up environment
+  rm(erp_data)
+  
+  message("Pipeline completed successfully!")
+  
+  return(list(
+    snr_data = snr_matrix,
+    signal_data = signal_matrix,
+    summary = summary_stats
+  ))
+}
+
+# Execute the main pipeline
+if (interactive()) {
+  results <- main()
+}
+```
+
+============================================================================
+SESSION INFORMATION
+============================================================================
+
+```{r session_info}
+# Document the R session for reproducibility
+sessionInfo()
+```
